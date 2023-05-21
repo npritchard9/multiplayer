@@ -1,7 +1,6 @@
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, StreamExt, TryStreamExt};
 use std::{
-    collections::HashMap,
     io::Error as IoError,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -9,12 +8,34 @@ use std::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 
+pub mod state;
+use state::*;
+
+#[derive(Debug)]
+struct Room {
+    r1: Option<SocketAddr>,
+    r1tx: Option<Tx>,
+    r2: Option<SocketAddr>,
+    r2tx: Option<Tx>,
+    state: State,
+}
+
+impl Room {
+    pub fn new(r1: Option<SocketAddr>) -> Self {
+        Room {
+            r1,
+            r1tx: None,
+            r2: None,
+            r2tx: None,
+            state: State::Waiting,
+        }
+    }
+}
+
 type Tx = UnboundedSender<Message>;
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
-type Room = [Option<SocketAddr>; 2];
 type Rooms = Arc<Mutex<Vec<Room>>>;
 
-async fn hc2(peer_map: PeerMap, rooms: Rooms, raw_stream: TcpStream, addr: SocketAddr) {
+async fn hc2(rooms: Rooms, raw_stream: TcpStream, addr: SocketAddr) {
     println!("Incoming connection from: {}", addr);
 
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
@@ -23,24 +44,29 @@ async fn hc2(peer_map: PeerMap, rooms: Rooms, raw_stream: TcpStream, addr: Socke
     println!("websocket connection established: {}", addr);
 
     let (tx, rx) = unbounded();
-    peer_map.lock().unwrap().insert(addr, tx);
 
     let mut able_to_insert = false;
 
     for room in rooms.lock().unwrap().iter_mut() {
-        if room[0].is_none() {
-            room[0] = Some(addr);
+        if room.r1.is_none() {
+            room.r1 = Some(addr);
+            room.r1tx = Some(tx.clone());
             able_to_insert = true;
             break;
-        } else if room[1].is_none() {
-            room[1] = Some(addr);
+        } else if room.r2.is_none() {
+            room.r2 = Some(addr);
+            room.r2tx = Some(tx.clone());
             able_to_insert = true;
+            room.state = State::Ready;
             break;
         }
     }
 
     if !able_to_insert {
-        rooms.lock().unwrap().push([Some(addr), None]);
+        let mut r = rooms.lock().unwrap();
+        r.push(Room::new(Some(addr)));
+        let last = r.last_mut().unwrap();
+        last.r1tx = Some(tx.clone());
     }
 
     let (outgoing, incoming) = ws_stream.split();
@@ -55,29 +81,23 @@ async fn hc2(peer_map: PeerMap, rooms: Rooms, raw_stream: TcpStream, addr: Socke
         let r = rooms.lock().unwrap();
 
         if msg.len() > 0 {
-            let recps = r
+            let room = r
                 .iter()
-                .filter_map(|room| {
-                    if room[0] == Some(addr) {
-                        room[1]
-                    } else if room[1] == Some(addr) {
-                        room[0]
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<SocketAddr>>();
+                .find(|room| room.r1 == Some(addr) || room.r2 == Some(addr))
+                .unwrap();
+            let (recp, tx) = if room.r1 == Some(addr) {
+                (room.r2, room.r2tx.clone())
+            } else if room.r2 == Some(addr) {
+                (room.r1, room.r1tx.clone())
+            } else {
+                (None, None)
+            };
 
-            println!("rooms: {r:?}");
-            println!("recps: {recps:?}");
-            for rcp in recps {
-                peer_map
-                    .lock()
-                    .unwrap()
-                    .get(&rcp)
-                    .unwrap()
-                    .unbounded_send(msg.clone())
-                    .unwrap();
+            println!("rooms: {r:#?}");
+            println!("recp: {recp:?}");
+            room.state.game_status();
+            if let Some(_r) = recp {
+                tx.unwrap().unbounded_send(msg.clone()).unwrap();
             }
         }
 
@@ -90,34 +110,47 @@ async fn hc2(peer_map: PeerMap, rooms: Rooms, raw_stream: TcpStream, addr: Socke
     future::select(broadcast_incoming, receive_from_others).await;
 
     println!("{} disconnected", &addr);
-    peer_map.lock().unwrap().remove(&addr);
+    let mut to_remove = vec![];
     let mut r = rooms.lock().unwrap();
-    for room in r.iter_mut() {
-        if let Some(r0) = room[0] {
-            if r0 == addr {
-                room[0] = room[1];
-                room[1] = None;
-                break;
-            }
-        }
-        if let Some(r1) = room[1] {
+    for (i, room) in r.iter_mut().enumerate() {
+        if let Some(r1) = room.r1 {
             if r1 == addr {
-                room[1] = None;
-                break;
+                room.r1 = room.r2;
+                room.r1tx = room.r2tx.clone();
+                room.r2 = None;
+                room.r2tx = None;
+                room.state = State::Waiting;
             }
         }
+        if let Some(r2) = room.r2 {
+            if r2 == addr {
+                room.r2 = None;
+                room.r2tx = None;
+                room.state = State::Waiting;
+            }
+        }
+        if room.r1.is_none() && room.r2.is_none() {
+            to_remove.push(i);
+        }
+    }
+    // would i even want to do this
+    // or would it make sense to leave
+    // a certain number of rooms open
+    // to reduce allocations
+    for i in to_remove {
+        println!("removing {:#?}", r[i]);
+        r.swap_remove(i);
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
-    let state = PeerMap::new(Mutex::new(HashMap::new()));
     let rooms = Rooms::new(Mutex::new(Vec::with_capacity(8)));
 
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
 
     while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(hc2(state.clone(), rooms.clone(), stream, addr));
+        tokio::spawn(hc2(Arc::clone(&rooms), stream, addr));
     }
     Ok(())
 }
